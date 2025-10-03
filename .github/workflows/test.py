@@ -59,11 +59,6 @@ STRONG_CIPHERS = (
 )
 
 def requests_session() -> requests.Session:
-    """Create a requests session with TLS 1.2+ enforcement"""
-    session = requests.Session()
-
-    # stronger：TLS client context
-    def requests_session() -> requests.Session:
     """Create a requests session with strict TLS 1.2+ enforcement (SonarCloud compliant)"""
     session = requests.Session()
 
@@ -625,4 +620,3 @@ if __name__ == '__main__':
         print("\n\n🛑 Application stopped by user")
     except Exception as e:
         print(f"\n❌ Failed to start HTTPS server: {str(e)}")
-        
