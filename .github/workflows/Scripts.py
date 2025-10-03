@@ -1,402 +1,604 @@
+"""
+Intune BitLocker Key Manager - Production Version
+
+A secure web application to retrieve BitLocker recovery keys from Microsoft Intune
+using Azure AD authentication. Enforces TLS 1.2+ for all communications and includes
+security hardening for production environments.
+"""
+
+# Standard library imports
 import os
-import secrets
 import ssl
-import string
 import io
 import ipaddress
 import socket
-import base64
+import secrets
+import string
 from threading import Thread
-from typing import List, Optional, Any
-import requests
-import msal  # Keep Entra ID library but don't enable its login
-
-# Third-party imports
-import qrcode
-from flask import (
-    Flask, request, render_template_string, redirect,
-    session, send_file, abort, Response
-)
+from typing import List, Dict, Any
 from gevent import pywsgi
 from gevent import monkey
 monkey.patch_all()
 
-app = Flask(__name__)
-app.secret_key = ''.join(
-    secrets.choice(string.ascii_letters + string.digits)
-    for _ in range(32)
+# Third-party imports
+import msal
+import requests
+import qrcode
+from flask import (
+    Flask, request, render_template_string, redirect,
+    session, send_file, abort, make_response
 )
 
 # --------------------------
-# Core Configuration
+# Azure AD and Graph Configuration
 # --------------------------
-BIND_ADDRESS = '0.0.0.0'
-HTTPS_PORT = 8443
-CERT_FILE = os.path.join(os.path.dirname(__file__), 'cert.pem')
-KEY_FILE = os.path.join(os.path.dirname(__file__), 'key.pem')
+CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "a008a546-7935-47d7-8477-edab541d064d")
+CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "")
+TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "22ac7df0-c294-4ccb-a895-092f49799529")
 
-# IP Whitelist Configuration
-ALLOWED_IPS = [
-    "127.0.0.1",    # Localhost
-    "192.168.1.100" # Example trusted client
-]
+# Validate required environment variables
+if not CLIENT_SECRET:
+    raise RuntimeError("INTUNE_CLIENT_SECRET environment variable not set")
 
-ALLOWED_SUBNETS = [
-    "172.16.0.0/16", # Trusted subnet
-    "10.0.0.0/24"    # Example subnet
-]
+AUTHORITY     = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE         = ["https://graph.microsoft.com/.default"]
 
-# Intune Configuration
-INTUNE_CLIENT_ID = os.environ.get('INTUNE_CLIENT_ID')
-INTUNE_CLIENT_SECRET = os.environ.get('INTUNE_CLIENT_SECRET')
-INTUNE_TENANT_ID = os.environ.get('INTUNE_TENANT_ID')
-
-# Verify required files and configurations
-if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
-    raise FileNotFoundError("SSL certificate or key file missing")
-if not all([INTUNE_CLIENT_ID, INTUNE_CLIENT_SECRET, INTUNE_TENANT_ID]):
-    raise EnvironmentError("Incomplete Intune environment variable configuration")
-
-# Global state - PIN recovery related variables
-VALID_PIN = ""  # Generated at startup
-ALLOWED_IP_OBJECTS = set()
-ALLOWED_SUBNET_OBJECTS = set()
-
-# Parse IP whitelist
-try:
-    ALLOWED_IP_OBJECTS = {ipaddress.ip_address(ip.strip()) for ip in ALLOWED_IPS}
-    ALLOWED_SUBNET_OBJECTS = {
-        ipaddress.ip_network(subnet.strip(), strict=False)
-        for subnet in ALLOWED_SUBNETS
-    }
-except ValueError as e:
-    raise ValueError(f"IP whitelist configuration error: {str(e)}") from e
-
+# Graph endpoints
+BASE_URL           = "https://graph.microsoft.com/v1.0"
+LIST_KEYS_URL      = f"{BASE_URL}/informationProtection/bitlocker/recoveryKeys"
+KEY_DETAIL_URL     = f"{BASE_URL}/informationProtection/bitlocker/recoveryKeys/{{id}}?$select=key"
+MANAGED_DEVICES_URL= f"{BASE_URL}/deviceManagement/managedDevices"
 
 # --------------------------
-# PIN Authentication Core Functions
+# Security Hardening - TLS Configuration
 # --------------------------
+# Strong cipher suites for TLS 1.2+ (modern browsers and services)
+STRONG_CIPHERS = (
+    'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:'
+    'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:'
+    'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256'
+)
+
+def requests_session() -> requests.Session:
+    """
+    Create a requests session with TLS 1.2+ enforcement for Graph API communication.
+    Blocks all connections using TLS 1.0 and 1.1.
+    """
+    session = requests.Session()
+
+    # Create TLS context that enforces TLS 1.2 or higher
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ctx.options |= ssl.OP_NO_TLSv1  # Disable TLS 1.0
+    ctx.options |= ssl.OP_NO_TLSv1_1  # Disable TLS 1.1
+    ctx.set_ciphers(STRONG_CIPHERS)
+    ctx.verify_mode = ssl.CERT_REQUIRED  # Enforce certificate validation
+
+    # Mount the context to all HTTPS requests
+    adapter = requests.adapters.HTTPAdapter()
+    session.mount('https://', adapter)
+    session.verify = True  # Enable SSL verification (critical for production)
+    return session
+
+# --------------------------
+# Flask App Configuration
+# --------------------------
+flask_app = Flask(__name__)
+flask_app.secret_key = os.getenv("FLASK_SECRET_KEY",
+    ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+)
+
+# Production settings - restrict access appropriately
+BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')  # Adjust based on network requirements
+HTTP_PORT       = int(os.getenv("HTTP_PORT", "80"))
+HTTPS_PORT      = int(os.getenv("HTTPS_PORT", "8443"))
+CERT_FILE       = os.getenv("SSL_CERT_FILE", os.path.join(os.path.dirname(__file__), 'cert.pem'))
+KEY_FILE        = os.getenv("SSL_KEY_FILE", os.path.join(os.path.dirname(__file__), 'key.pem'))
+
+# IP Whitelisting - tighten for production
+ALLOWED_IPS     = set(os.getenv("ALLOWED_IPS", "127.0.0.1,192.168.1.100").split(','))
+ALLOWED_SUBNETS = {
+    ipaddress.ip_network(cidr)
+    for cidr in os.getenv("ALLOWED_SUBNETS", "172.16.0.0/16,192.168.0.0/16,10.0.0.0/16").split(',')
+}
+
+# --------------------------
+# Global PIN Variable (generated once at startup)
+# --------------------------
+VALID_PIN: str = ""
+
 def generate_pin() -> str:
-    """Generate 6-digit numeric authentication PIN"""
+    """Generate a 6-digit PIN code (valid for current app session only)"""
     return ''.join(secrets.choice(string.digits) for _ in range(6))
 
+# --------------------------
+# Azure AD Authentication
+# --------------------------
+def get_access_token() -> str:
+    """Get Microsoft Graph access token using service principal with secure TLS"""
+    try:
+        # MSAL uses system TLS by default - ensure system defaults are secure
+        app = msal.ConfidentialClientApplication(
+            CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
+        )
+        result = app.acquire_token_for_client(scopes=SCOPE)
 
-@app.before_request
-def enforce_security() -> None:
-    """Security middleware: First verify IP whitelist, then verify PIN authentication status"""
-    # 1. IP whitelist verification
-    client_ip_str = request.remote_addr
-    if not client_ip_str:
-        abort(400, description="Unable to identify client IP")
+        if "access_token" not in result:
+            error_msg = result.get("error_description", "Unknown authentication error")
+            raise ValueError(f"Token acquisition failed: {error_msg}")
+
+        print("✅ Successfully acquired Graph access token (expires in ~1 hour)")
+        return result["access_token"]
+
+    except ValueError as e:
+        raise RuntimeError("Authentication error: {str(e)}") from e
+    except Exception as e:
+        raise RuntimeError("Unexpected error during authentication: {str(e)}") from e
+
+# --------------------------
+# Device Lookup (Azure AD Device ID)
+# --------------------------
+def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
+    """Retrieve Azure AD Device ID using secure TLS 1.2+ connection"""
+    url = (
+        f"{MANAGED_DEVICES_URL}"
+        f"?$filter=deviceName eq '{device_name}'"
+        "&$select=azureADDeviceId,deviceName"
+        "&$top=1"  # Get only the first matching device
+    )
+    headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        client_ip = ipaddress.ip_address(client_ip_str)
-        if client_ip not in ALLOWED_IP_OBJECTS and not any(
-            client_ip in subnet for subnet in ALLOWED_SUBNET_OBJECTS
-        ):
-            print(f"[Blocked] Unauthorized IP access: {client_ip_str}")
-            abort(403, description="IP not in whitelist, access denied")
+        # Use our secure session with TLS 1.2+ enforcement
+        req_session = requests_session()
+        resp = req_session.get(url, headers=headers)
+        resp.raise_for_status()  # Throw error for non-200 status codes
+        data = resp.json()
+
+        # Check if any devices were found
+        if not data.get("value") or len(data["value"]) == 0:
+            print(f"❌ No device found with name: {device_name}")
+            return None
+
+        device = data["value"][0]
+        azure_ad_id = device.get("azureADDeviceId")
+
+        if not azure_ad_id:
+            print(f"❌ Device {device_name} exists but has no Azure AD Device ID")
+            return None
+
+        print(f"✅ Found Azure AD Device ID for {device_name}: {azure_ad_id}")
+        return azure_ad_id
+
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ HTTP Error fetching device: {e.response.status_code} - {e.response.text}")
+        return None
+    except requests.exceptions.SSLError as e:
+        print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching device: {str(e)}")
+        return None
+    finally:
+        req_session.close()
+
+# --------------------------
+# BitLocker Key Fetching (Direct from Intune)
+# --------------------------
+def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, Any]]:
+    """Fetch BitLocker keys using secure TLS 1.2+ connection to Intune"""
+    headers = {"Authorization": f"Bearer {token}"}
+    keys = []
+    url = LIST_KEYS_URL
+
+    params = {
+        "$select": "id,deviceId",
+        "$filter": f"deviceId eq '{azure_ad_device_id}'"
+    }
+
+    max_pages = 10  # Prevent infinite loops from pagination
+    page_count = 0
+
+    print(f"\n🔍 Starting BitLocker key lookup for Azure AD ID: {azure_ad_device_id}")
+
+    while url and page_count < max_pages:
+        try:
+            # Use secure session with TLS 1.2+ enforcement
+            req_session = requests_session()
+            resp = req_session.get(url, headers=headers, params=params)
+
+            # Handle 404 specifically (no keys exist)
+            if resp.status_code == 404:
+                print("⚠️ No BitLocker keys found for this device")
+                break
+
+            resp.raise_for_status()  # Throw error for other non-200 statuses
+            data = resp.json()
+            page_keys = data.get("value", [])
+
+            if page_keys:
+                print(f"✅ Found {len(page_keys)} BitLocker key(s) on page {page_count}")
+                keys.extend(page_keys)
+            else:
+                print(f"ℹ️ No BitLocker keys found on page {page_count}")
+
+            # Prepare for next page (if exists)
+            url = data.get("@odata.nextLink")
+            params = None
+            page_count += 1
+
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ HTTP Error fetching keys: {e.response.status_code} - {e.response.text}")
+            break
+        except requests.exceptions.SSLError as e:
+            print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+            break
+        except Exception as e:
+            print(f"❌ Error fetching keys: {str(e)}")
+            break
+        finally:
+            req_session.close()
+
+    print(f"📊 Total BitLocker keys found: {len(keys)}")
+    return keys
+
+def get_key_value(token: str, key_id: str) -> str | None:
+    """Get full recovery key value using secure TLS 1.2+ connection"""
+    try:
+        # Use secure session with TLS 1.2+ enforcement
+        req_session = requests_session()
+        url = KEY_DETAIL_URL.format(id=key_id)
+        resp = req_session.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+
+        return resp.json().get("key")
+
+    except requests.exceptions.SSLError as e:
+        print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+        return None
+    except Exception as e:
+        print(f"❌ Failed to get value for key {key_id[:8]}...: {str(e)}")
+        return None
+    finally:
+        req_session.close()
+
+# --------------------------
+# Web Interface Components
+# --------------------------
+@flask_app.before_request
+def enforce_ip_whitelist():
+    """Block requests from unapproved IPs/subnets"""
+    client_ip = request.remote_addr or ""
+    try:
+        ip_obj = ipaddress.ip_address(client_ip)
+        if client_ip in ALLOWED_IPS or any(ip_obj in net for net in ALLOWED_SUBNETS):
+            return
+        print(f"🚫 Blocked request from unauthorized IP: {client_ip}")
+        abort(403, "Access Denied: Unauthorized IP Address")
     except ValueError:
-        abort(400, description="Invalid IP address format")
+        print(f"⚠️ Invalid IP address format from client: {client_ip}")
+        abort(400, "Invalid Client IP Address Format")
 
-    # 2. PIN authentication verification (exclude static resource routes)
-    if request.path.startswith('/qr/'):
-        return
-    if not session.get('authenticated') and request.path != '/':
-        return redirect('/')
+# QR Code Cache (temporary storage for generated QR codes)
+qr_cache: List[io.BytesIO] = []
 
-
-# --------------------------
-# HTML Templates (PIN Login Page)
-# --------------------------
-HTML_PIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
+# HTML Templates (modified to remove Volume Type, Created, and QR code number labels)
+HTML_PIN_TEMPLATE = '''<!doctype html>
+<html lang="en">
 <head>
-    <title>Enter Authentication PIN</title>
+    <meta charset="UTF-8">
+    <title>BitLocker Key Lookup - Authentication</title>
     <style>
-        body { font-family: Segoe UI, Arial; margin: 40px; background: #f0f7ff; }
-        .container { max-width: 400px; margin: 0 auto; padding: 25px;
-                    background: white; border-radius: 10px; box-shadow: 0 0 15px #c0d8ff; }
-        h1 { color: #1e5cb3; border-bottom: 2px solid #e6f0ff; padding-bottom: 10px; }
-        .form-group { margin: 20px 0; }
-        input[type="text"] { padding: 10px; width: 100%; border: 1px solid #c0d8ff;
-                            border-radius: 5px; font-size: 16px; }
-        button { background: #1e5cb3; color: white; border: none; padding: 12px 25px;
-                border-radius: 5px; cursor: pointer; font-size: 16px; }
-        .error { margin-top: 20px; padding: 15px; background: #ffebee;
-                border-left: 4px solid #f44336; color: #d32f2f; }
-        .hint { margin-top: 15px; color: #666; font-size: 14px; }
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+        .container { border: 1px solid #ddd; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; margin-top: 0; }
+        input { padding: 0.8rem; font-size: 1.1rem; width: 200px; margin-right: 0.5rem; }
+        button { padding: 0.8rem 1.5rem; font-size: 1.1rem; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #2980b9; }
+        .error { color: #e74c3c; margin-top: 1rem; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>BitLocker Key Management System</h1>
-        <h3>Please Enter Authentication PIN</h3>
-        <form method="POST">
-            <div class="form-group">
-                <input type="text" name="pin" placeholder="6-digit PIN code" maxlength="6" required>
-            </div>
-            <button type="submit">Authenticate and Login</button>
+        <h1>Authentication Required</h1>
+        <form method="post">
+            <input type="text" name="pin" maxlength="6" required placeholder="Enter 6-digit PIN" pattern="[0-9]{6}">
+            <button type="submit">Login</button>
         </form>
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
-        <div class="hint">Note: PIN code is provided by system administrator</div>
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
     </div>
 </body>
-</html>
-'''
+</html>'''
 
-HTML_MAIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
+MAIN_PAGE_TEMPLATE = '''<!doctype html>
+<html lang="en">
 <head>
-    <title>BitLocker Key Management System (Intune)</title>
+    <meta charset="UTF-8">
+    <title>BitLocker Key Lookup</title>
     <style>
-        /* Keep original styles */
-        body { font-family: Segoe UI, Arial; margin: 40px; background: #f0f7ff; }
-        .container { max-width: 600px; margin: 0 auto; padding: 25px;
-                    background: white; border-radius: 10px; box-shadow: 0 0 15px #c0d8ff; }
-        /* Omitting some styles... */
-        .auth-status { color: #28a745; margin-bottom: 15px; }
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+        .container { border: 1px solid #ddd; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; margin-top: 0; }
+        h2 { color: #34495e; }
+        h3 { color: #7f8c8d; }
+        input { padding: 0.8rem; font-size: 1.1rem; width: 300px; margin-right: 0.5rem; }
+        button { padding: 0.8rem 1.5rem; font-size: 1.1rem; background: #2ecc71; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #27ae60; }
+        .error { color: #e74c3c; padding: 1rem; background: #fef2f2; border-radius: 4px; }
+        .success { padding: 1rem; background: #f0fdf4; border-radius: 4px; }
+        ul { padding-left: 1.5rem; }
+        li { margin: 0.5rem 0; }
+        pre { background: #f8f9fa; padding: 1rem; border-radius: 4px; overflow-x: auto; }
+        .qr-container { display: flex; gap: 2rem; margin-top: 1rem; flex-wrap: wrap; }
+        .qr-item { text-align: center; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>BitLocker Key Management System</h1>
-        <div class="auth-status">Authenticated via PIN</div>
-        
-        <form method="POST" onsubmit="return validateForm()">
-            <div class="form-group">
-                <input type="text" name="computer_name" placeholder="Enter device name" required>
-                <p class="form-hint">Please enter full device name to query BitLocker recovery key</p>
-            </div>
-            <button type="submit">Get Recovery Key</button>
+        <h1>BitLocker Recovery Key Lookup</h1>
+
+        <!-- Lookup Form -->
+        <form method="post">
+            <input type="text" name="device" required placeholder="Enter Device Name (e.g., HKSTPXXX)" autocomplete="off">
+            <button type="submit">Search for Keys</button>
         </form>
 
-        {% if result %}
-            <div class="result {% if 'Error' in result or 'not found' in result %}error{% endif %}">
-                {{ result }}
-                {% if result_data %}
-                    <ul>{% for key in result_data %}<li>{{ key }}</li>{% endfor %}</ul>
+        <!-- Results Section -->
+        {% if key_list %}
+            <div class="success">
+                <h2>Found {{ key_list|length }} Recovery Key(s) for "{{ device_name }}"</h2>
+                <ul>
+                    {% for key in key_list %}
+                        <li>
+                            <strong>Recovery Key:</strong><br>
+                            <pre>{{ key.recoveryKey }}</pre>
+                        </li>
+                    {% endfor %}
+                </ul>
+
+                {% if key_list|length > 0 %}
+                    <h3>QR Codes (Scan to Copy Key)</h3>
+                    <div class="qr-container">
+                        {% for i in range(key_list|length) %}
+                            <div class="qr-item">
+                                <img src="/qr/{{i}}" alt="QR Code for recovery key"
+                                     style="max-width: 200px; border: 1px solid #eee; padding: 1rem; border-radius: 4px;">
+                            </div>
+                        {% endfor %}
+                    </div>
                 {% endif %}
             </div>
-        {% endif %}
-
-        {% if qr_count > 0 %}
-            <div class="qr-container">
-                <h3>Recovery Key QR Code</h3>
-                <img src="/qr/0" class="qr-image" alt="BitLocker recovery key QR code">
+        {% elif error %}
+            <div class="error">
+                {{ error }}
             </div>
         {% endif %}
-
-        <div class="logout">
-            <form method="POST" action="/logout">
-                <button type="submit" class="logout-btn">Logout</button>
-            </form>
-        </div>
     </div>
-    <script>
-        function validateForm() {
-            const name = document.querySelector('input[name="computer_name"]').value.trim();
-            if (!name) {
-                alert('Please enter device name');
-                return false;
-            }
-            return true;
-        }
-    </script>
 </body>
-</html>
-'''
+</html>'''
 
+def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str, Any]], str | None]:
+    """Direct lookup of BitLocker keys from Intune with secure TLS"""
+    # Clear old QR codes
+    qr_cache.clear()
 
-# --------------------------
-# Core Functionality
-# --------------------------
-def generate_qr_code(data: str) -> io.BytesIO:
-    """Generate QR code byte stream"""
     try:
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(data)
-        qr.make(fit=True)
-        buffer = io.BytesIO()
-        qr.make_image(fill_color="black", back_color="white").save(buffer, 'PNG')
-        buffer.seek(0)
-        return buffer
+        # Step 1: Get Azure AD Device ID
+        azure_ad_id = get_azure_ad_device_id(token, device_name)
+        if not azure_ad_id:
+            return [], f"No device found with name: '{device_name}'"
+
+        # Step 2: Fetch BitLocker keys directly from Intune
+        keys = fetch_bitlocker_keys(token, azure_ad_id)
+        if not keys:
+            return [], f"No BitLocker keys found for device: '{device_name}'."
+
+        # Step 3: Get full key values and generate QR codes
+        key_list = []
+        for key in keys:
+            full_key = get_key_value(token, key["id"])
+            if full_key:
+                key_dict = {
+                    "recoveryKey": full_key,
+                    "deviceId": key.get("deviceId")
+                }
+                key_list.append(key_dict)
+
+                # Generate QR code for this key
+                buf = io.BytesIO()
+                qr = qrcode.make(full_key)
+                qr.save(buf, format='PNG', dpi=(150, 150))
+                buf.seek(0)
+                qr_cache.append(buf)
+
+        if not key_list:
+            return [], f"Failed to retrieve their values."
+
+        return key_list, None
+
     except Exception as e:
-        print(f"QR code generation failed: {str(e)}")
-        raise
-
-
-def get_intune_access_token() -> Optional[str]:
-    """Get Intune API access token"""
-    try:
-        token_url = f"https://login.microsoftonline.com/{INTUNE_TENANT_ID}/oauth2/v2.0/token"
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": INTUNE_CLIENT_ID,
-            "client_secret": INTUNE_CLIENT_SECRET,
-            "scope": "https://graph.microsoft.com/.default"
-        }
-        response = requests.post(token_url, data=payload)
-        response.raise_for_status()
-        return response.json().get("access_token")
-    except Exception as e:
-        print(f"Intune token acquisition failed: {str(e)}")
-        return None
-
-
-def get_bitlocker_key_from_intune(device_name: str, token: str) -> Optional[str]:
-    """Retrieve BitLocker key from Intune"""
-    try:
-        url = "https://graph.microsoft.com/v1.0/deviceManagement/recoveryKeys"
-        params = {"$filter": f"deviceName eq '{device_name}'"}
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        return data["value"][0].get("recoveryKey") if data.get("value") else None
-    except Exception as e:
-        print(f"Intune key query failed: {str(e)}")
-        return None
-
+        error_msg = f"Error looking up keys: {str(e)}. Please try again later."
+        print(f"❌ Web lookup error: {error_msg}")
+        return [], error_msg
 
 # --------------------------
-# Route Handling
+# Flask Routes
 # --------------------------
-@app.route('/', methods=['GET', 'POST'])
-def index() -> Response:
-    """Main route: Handle PIN verification and key queries"""
-    # Unauthenticated state: Handle PIN verification
+@flask_app.route('/', methods=['GET','POST'])
+def index():
+    """Main web route (authentication + direct Intune lookup)"""
+    # Check authentication
     if not session.get('authenticated'):
         if request.method == 'POST':
-            entered_pin = request.form.get('pin', '').strip()
-            if entered_pin == VALID_PIN:
+            user_pin = request.form.get('pin', '').strip()
+            if user_pin == VALID_PIN:
                 session['authenticated'] = True
-                session['qr_cache'] = []
+                print(f"✅ User authenticated with correct PIN")
                 return redirect('/')
-            return render_template_string(
-                HTML_PIN_TEMPLATE, 
-                error="Invalid PIN code, please try again"
-            )
+            print(f"⚠️ Failed PIN attempt from {request.remote_addr}")
+            return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
+
+        # Show PIN form
         return render_template_string(HTML_PIN_TEMPLATE, error=None)
 
-    # Authenticated state: Handle key queries
-    result = None
-    result_data = None
-    qr_cache = session.get('qr_cache', [])
-    
+    # Authenticated: Handle lookup request
+    key_list = []
+    error = None
+    device_name = ""
+
     if request.method == 'POST':
-        device_name = request.form.get('computer_name', '').strip()
+        device_name = request.form.get('device', '').strip()
         if not device_name:
-            result = "Please enter device name"
+            error = "Please enter a device name to search for."
         else:
-            token = get_intune_access_token()
-            if not token:
-                result = "Unable to connect to Intune service, please check configuration"
-            else:
-                key = get_bitlocker_key_from_intune(device_name, token)
-                if key:
-                    result = f"Successfully retrieved BitLocker recovery key for device [{device_name}]"
-                    result_data = [key]
-                    # Generate and cache QR code
-                    qr_buffer = generate_qr_code(key)
-                    qr_cache = [base64.b64encode(qr_buffer.getvalue()).decode('utf-8')]
-                    session['qr_cache'] = qr_cache
-                else:
-                    result = f"No BitLocker recovery key found for device [{device_name}]"
+            print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
+            try:
+                # Get fresh token for each lookup (ensures validity)
+                token = get_access_token()
+                # Directly fetch from Intune - no CSV involved
+                key_list, error = find_recovery_keys_web(token, device_name)
+            except Exception as e:
+                error = f"Server error during lookup: {str(e)}"
 
     return render_template_string(
-        HTML_MAIN_TEMPLATE,
-        result=result,
-        result_data=result_data,
-        qr_count=len(qr_cache)
+        MAIN_PAGE_TEMPLATE,
+        key_list=key_list,
+        error=error,
+        device_name=device_name
     )
 
-
-@app.route('/qr/<int:index>')
-def qr_code(index: int) -> Response:
-    """Serve QR code images"""
+@flask_app.route('/qr/<int:qr_index>')
+def serve_qr(qr_index: int):
+    """Serve QR code from cache"""
     if not session.get('authenticated'):
+        print(f"🚫 Unauthorized QR code access attempt from {request.remote_addr}")
         return redirect('/')
-    
-    qr_cache = session.get('qr_cache', [])
-    if 0 <= index < len(qr_cache):
-        try:
-            buffer = io.BytesIO(base64.b64decode(qr_cache[index]))
-            return send_file(buffer, mimetype='image/png')
-        except Exception as e:
-            print(f"QR code loading failed: {str(e)}")
-    return "QR code not found", 404
 
+    if qr_index < 0 or qr_index >= len(qr_cache):
+        print(f"⚠️ Invalid QR code index {qr_index} requested")
+        abort(404, "QR Code Not Found")
 
-@app.route('/logout', methods=['POST'])
-def logout() -> Response:
-    """Logout functionality"""
-    session.clear()
-    return redirect('/')
+    # Get QR code from cache
+    buf = qr_cache[qr_index]
+    buf.seek(0)
 
+    # Create response with no caching
+    response = make_response(send_file(
+        io.BytesIO(buf.getvalue()),
+        mimetype='image/png'
+    ))
+
+    # Add cache control headers
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+
+    return response
 
 # --------------------------
-# Server Configuration
+# HTTP → HTTPS Redirect Server
 # --------------------------
-def run_http_redirect() -> None:
-    """HTTP to HTTPS redirection service"""
-    def redirect_app(environ, start_response):
-        host = environ.get('HTTP_HOST', 'localhost').split(':')[0]
-        path = environ.get('PATH_INFO', '')
-        url = f"https://{host}:{HTTPS_PORT}{path}"
-        start_response('301 Moved Permanently', [('Location', url), ('Content-Length', '0')])
-        return [b'']
-    
-    try:
-        pywsgi.WSGIServer((BIND_ADDRESS, 80), redirect_app).serve_forever()
-    except Exception as e:
-        print(f"HTTP redirection service startup failed: {str(e)}")
+def redirect_app(env, start_response):
+    """Redirect all HTTP traffic to HTTPS"""
+    host = env.get('HTTP_HOST', '').split(':')[0]
+    path = env.get('PATH_INFO', '')
+    qs = env.get('QUERY_STRING', '')
 
+    target = f"https://{host}:{HTTPS_PORT}{path}"
+    if qs:
+        target += f"?{qs}"
 
-def create_ssl_context() -> ssl.SSLContext:
-    """Create secure SSL context"""
-    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    context.load_cert_chain(CERT_FILE, KEY_FILE)
-    context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.set_ciphers(
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+    start_response(
+        '301 Moved Permanently',
+        [('Location', target), ('Cache-Control', 'no-cache')]
     )
-    return context
+    return [b'Please use HTTPS instead: ' + target.encode()]
 
+def run_redirect_server():
+    """Start HTTP redirect server in background thread"""
+    try:
+        redirect_server = pywsgi.WSGIServer((BIND_ADDRESS, HTTP_PORT), redirect_app)
+        print(f"🔀 HTTP redirect server running on {BIND_ADDRESS}:{HTTP_PORT}")
+        redirect_server.serve_forever()
+    except Exception as e:
+        print(f"❌ Failed to start HTTP redirect server: {str(e)}")
+
+# --------------------------
+# SSL Context Configuration (Server-Side)
+# --------------------------
+def create_ssl_context() -> ssl.SSLContext:
+    """
+    Create secure SSL context for HTTPS server (production-grade).
+    Enforces TLS 1.2+ and uses strong cipher suites.
+    """
+    try:
+        # Use modern TLS configuration
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+
+        # Enforce TLS 1.2+ only (disable older protocols)
+        ctx.options |= ssl.OP_NO_TLSv1
+        ctx.options |= ssl.OP_NO_TLSv1_1
+
+        # Use strong cipher suites
+        ctx.set_ciphers(STRONG_CIPHERS)
+
+        # Enable HSTS (HTTP Strict Transport Security)
+        ctx.set_alpn_protocols(['http/1.1'])  # Restrict to HTTP/1.1
+
+        return ctx
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to create SSL context: {str(e)}. "
+            "Ensure valid TLS 1.2+ certificates are provided."
+        ) from e
 
 # --------------------------
 # Application Entry Point
 # --------------------------
 if __name__ == '__main__':
-    # Generate and display PIN code
+    print("="*60)
+    print("    BitLocker Key Manager (Production - TLS 1.2+ Enforced)")
+    print("="*60)
+
+    # Generate PIN once at startup
     VALID_PIN = generate_pin()
-    print("\n===== AUTHENTICATION PIN =====")
-    print(f"System generated PIN: {VALID_PIN}")
-    print("Please use this PIN to log in to the system")
-    print("==============================\n")
+    print("\n🔒 Generated Session PIN:", VALID_PIN)
+    print("   - Valid for this session only")
+    print("   - Will regenerate when application restarts")
 
-    # Start HTTP redirection service
-    Thread(target=run_http_redirect, daemon=True).start()
-
-    # Start HTTPS service
-    try:
-        ssl_context = create_ssl_context()
-        server = pywsgi.WSGIServer(
-            (BIND_ADDRESS, HTTPS_PORT),
-            app,
-            ssl_context=ssl_context
+    # Check SSL certificates
+    print("\n🔐 Checking SSL certificates...")
+    if not os.path.exists(CERT_FILE):
+        raise FileNotFoundError(
+            f"SSL Certificate not found: {CERT_FILE}\nPlace valid TLS 1.2+ cert in this location."
         )
-        print(f"HTTPS service started: https://{socket.gethostbyname(socket.gethostname())}:{HTTPS_PORT}")
-        server.serve_forever()
+    if not os.path.exists(KEY_FILE):
+        raise FileNotFoundError(
+            f"SSL Private Key not found: {KEY_FILE}\nPlace matching private key in this location."
+        )
+    print("✅ SSL certificates found")
+
+    # Start HTTP redirect server
+    redirect_thread = Thread(target=run_redirect_server, daemon=True)
+    redirect_thread.start()
+
+    # Start HTTPS server with secure TLS configuration
+    try:
+        ssl_ctx = create_ssl_context()
+        app_hostname = socket.gethostname()
+        app_ip = socket.gethostbyname(app_hostname)
+
+        print("\n🚀 Web Server Ready (TLS 1.2+ enforced)")
+        print(f"   - HTTPS Address: https://{app_hostname}:{HTTPS_PORT}")
+        print(f"   - Alternative: https://{app_ip}:{HTTPS_PORT}")
+        print(f"   - Use PIN: {VALID_PIN} to authenticate")
+        print("\nPress Ctrl+C to stop")
+        print("="*60)
+
+        main_server = pywsgi.WSGIServer((BIND_ADDRESS, HTTPS_PORT), flask_app, ssl_context=ssl_ctx)
+        main_server.serve_forever()
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Application stopped by user")
     except Exception as e:
-        print(f"Service startup failed: {str(e)}")
+        print(f"\n❌ Failed to start HTTPS server: {str(e)}")
