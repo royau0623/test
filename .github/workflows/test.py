@@ -25,18 +25,16 @@ import requests
 import qrcode
 from flask import (
     Flask, request, render_template_string, redirect,
-    session, send_file, abort, make_response, url_for
+    session, send_file, abort, make_response
 )
-from flask_wtf import CSRFProtect, FlaskForm
-from wtforms import StringField, SubmitField
-from wtforms.validators import DataRequired, Regexp, Length
+from flask_wtf import CSRFProtect  # Import CSRF protection
 
 # --------------------------
 # Azure AD and Graph Configuration
 # --------------------------
-CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "")
-TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "")
+CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "a008a546-7935-47d7-8477-edab541d064d")
+CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "z4h8Q~Sr-oXYIaup4FwN3B4WfT4Lkon4Nig~3c~t")
+TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "22ac7df0-c294-4ccb-a895-092f49799529")
 
 # Validate required environment variables
 if not CLIENT_SECRET:
@@ -64,13 +62,11 @@ def requests_session() -> requests.Session:
     """Create a requests session with TLS 1.2+ enforcement"""
     session = requests.Session()
 
-    # Stronger：TLS client context
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     ctx.options |= ssl.OP_NO_TLSv1
     ctx.options |= ssl.OP_NO_TLSv1_1
     ctx.set_ciphers(STRONG_CIPHERS)
     ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.check_hostname = True
 
     adapter = requests.adapters.HTTPAdapter()
     session.mount('https://', adapter)
@@ -111,28 +107,6 @@ VALID_PIN: str = ""
 def generate_pin() -> str:
     """Generate a 6-digit PIN code"""
     return ''.join(secrets.choice(string.digits) for _ in range(6))
-
-# --------------------------
-# Flask-WTF Forms
-# --------------------------
-class LoginForm(FlaskForm):
-    pin = StringField(
-        "PIN",
-        validators=[
-            DataRequired(),
-            Length(min=6, max=6),
-            Regexp("^[0-9]{6}$", message="PIN must be 6 digits")
-        ]
-    )
-    submit = SubmitField("Login")
-
-
-class DeviceSearchForm(FlaskForm):
-    device = StringField(
-        "Device Name",
-        validators=[DataRequired(message="Please enter a device name.")]
-    )
-    submit = SubmitField("Search for Keys")
 
 # --------------------------
 # Azure AD Authentication
@@ -295,7 +269,7 @@ def enforce_ip_whitelist():
 # QR Code Cache
 qr_cache: List[io.BytesIO] = []
 
-# HTML Templates with CSRF Token Rendering via FlaskForm
+# HTML Templates with CSRF Tokens
 HTML_PIN_TEMPLATE = '''<!doctype html>
 <html lang="en">
 <head>
@@ -314,10 +288,11 @@ HTML_PIN_TEMPLATE = '''<!doctype html>
 <body>
     <div class="container">
         <h1>Authentication Required</h1>
-        <form method="post" action="{{ url_for('login') }}">
-            {{ form.hidden_tag() }}
-            {{ form.pin(size=6, maxlength=6, placeholder="Enter 6-digit PIN", pattern="[0-9]{6}") }}
-            {{ form.submit() }}
+        <form method="post" action="/login">
+            <!-- CSRF Token for security -->
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="text" name="pin" maxlength="6" required placeholder="Enter 6-digit PIN" pattern="[0-9]{6}">
+            <button type="submit">Login</button>
         </form>
         {% if error %}<p class="error">{{ error }}</p>{% endif %}
     </div>
@@ -351,12 +326,14 @@ MAIN_PAGE_TEMPLATE = '''<!doctype html>
     <div class="container">
         <h1>BitLocker Recovery Key Lookup</h1>
 
-        <form method="post" action="{{ url_for('index') }}">
-            {{ form.hidden_tag() }}
-            {{ form.device(size=30, placeholder="Enter Device Name (e.g., HKSTPXXX)", autocomplete="off") }}
-            {{ form.submit() }}
+        <!-- Lookup Form with CSRF Token -->
+        <form method="post" action="/search">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="text" name="device" required placeholder="Enter Device Name (e.g., HKSTPXXX)" autocomplete="off">
+            <button type="submit">Search for Keys</button>
         </form>
 
+        <!-- Results Section -->
         {% if key_list %}
             <div class="success">
                 <h2>Found {{ key_list|length }} Recovery Key(s) for "{{ device_name }}"</h2>
@@ -374,7 +351,7 @@ MAIN_PAGE_TEMPLATE = '''<!doctype html>
                     <div class="qr-container">
                         {% for i in range(key_list|length) %}
                             <div class="qr-item">
-                                <img src="{{ url_for('serve_qr', qr_index=i) }}" alt="QR Code for recovery key"
+                                <img src="/qr/{{i}}" alt="QR Code for recovery key"
                                      style="max-width: 200px; border: 1px solid #eee; padding: 1rem; border-radius: 4px;">
                             </div>
                         {% endfor %}
@@ -432,44 +409,47 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
 # --------------------------
 # Flask Routes
 # --------------------------
-@flask_app.route('/login', methods=['GET', 'POST'])  # Sensitive route with justified method usage
-def login():
-    """Login route with secure method separation:
-    - GET: Safely displays login form (no state changes, no sensitive data processing)
-    - POST: Processes authentication with CSRF protection and input validation
-    Both methods are necessary and secured by:
-    - CSRF token validation (via Flask-WTF)
-    - Input sanitization (via WTForms validators)
-    - No sensitive data in URLs (POST used for credential submission)
-    """
-    form = LoginForm()
-    if session.get('authenticated'):
-        return redirect(url_for('index'))
-
-    if form.validate_on_submit():
-        user_pin = form.pin.data.strip()
-        if user_pin == VALID_PIN:
-            session['authenticated'] = True
-            print(f"✅ User authenticated with correct PIN")
-            return redirect(url_for('index'))
-        print(f"⚠️ Failed PIN attempt from {request.remote_addr}")
-        return render_template_string(HTML_PIN_TEMPLATE, form=form, error="Invalid PIN. Please try again.")
-
-    return render_template_string(HTML_PIN_TEMPLATE, form=form, error=None)
-
-
-@flask_app.route('/', methods=['GET', 'POST'])
+@flask_app.route('/', methods=['GET'])  # GET-only: safe method for page rendering
 def index():
+    """Main page renderer (GET-only).
+    - Unauthenticated users see the PIN form.
+    - Authenticated users see the search form.
+    """
     if not session.get('authenticated'):
-        return redirect(url_for('login'))
+        return render_template_string(HTML_PIN_TEMPLATE, error=None)
 
-    form = DeviceSearchForm()
+    return render_template_string(
+        MAIN_PAGE_TEMPLATE,
+        key_list=[],
+        error=None,
+        device_name=""
+    )
+
+@flask_app.route('/login', methods=['POST'])
+def login():
+    """PIN authentication (POST-only)"""
+    user_pin = request.form.get('pin', '').strip()
+    if user_pin == VALID_PIN:
+        session['authenticated'] = True
+        print(f"✅ User authenticated with correct PIN")
+        return redirect('/')
+    print(f"⚠️ Failed PIN attempt from {request.remote_addr}")
+    return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
+
+@flask_app.route('/search', methods=['POST'])
+def search():
+    """Device search and key lookup (POST-only)"""
+    if not session.get('authenticated'):
+        print(f"🚫 Unauthorized search attempt from {request.remote_addr}")
+        return redirect('/')
+
     key_list = []
     error = None
-    device_name = ""
+    device_name = request.form.get('device', '').strip()
 
-    if form.validate_on_submit():
-        device_name = form.device.data.strip()
+    if not device_name:
+        error = "Please enter a device name to search for."
+    else:
         print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
         try:
             token = get_access_token()
@@ -481,16 +461,15 @@ def index():
         MAIN_PAGE_TEMPLATE,
         key_list=key_list,
         error=error,
-        device_name=device_name,
-        form=form
+        device_name=device_name
     )
 
-
-@flask_app.route('/qr/<int:qr_index>', methods=['GET'])
+@flask_app.route('/qr/<int:qr_index>')  # GET-only by default (secure for read operations)
 def serve_qr(qr_index: int):
+    """Serve QR code from cache (read-only operation)"""
     if not session.get('authenticated'):
         print(f"🚫 Unauthorized QR code access attempt from {request.remote_addr}")
-        return redirect(url_for('login'))
+        return redirect('/')
 
     if qr_index < 0 or qr_index >= len(qr_cache):
         print(f"⚠️ Invalid QR code index {qr_index} requested")
@@ -514,6 +493,7 @@ def serve_qr(qr_index: int):
 # HTTP → HTTPS Redirect Server
 # --------------------------
 def redirect_app(env, start_response):
+    """Redirect all HTTP traffic to HTTPS"""
     host = env.get('HTTP_HOST', '').split(':')[0]
     path = env.get('PATH_INFO', '')
     qs = env.get('QUERY_STRING', '')
@@ -529,6 +509,7 @@ def redirect_app(env, start_response):
     return [b'Please use HTTPS instead: ' + target.encode()]
 
 def run_redirect_server():
+    """Start HTTP redirect server in background thread"""
     try:
         redirect_server = pywsgi.WSGIServer((BIND_ADDRESS, HTTP_PORT), redirect_app)
         print(f"🔀 HTTP redirect server running on {BIND_ADDRESS}:{HTTP_PORT}")
@@ -540,6 +521,7 @@ def run_redirect_server():
 # SSL Context Configuration
 # --------------------------
 def create_ssl_context() -> ssl.SSLContext:
+    """Create secure SSL context for HTTPS server"""
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT_FILE, KEY_FILE)
@@ -602,3 +584,4 @@ if __name__ == '__main__':
         print("\n\n🛑 Application stopped by user")
     except Exception as e:
         print(f"\n❌ Failed to start HTTPS server: {str(e)}")
+        
