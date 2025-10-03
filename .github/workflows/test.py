@@ -64,11 +64,13 @@ def requests_session() -> requests.Session:
     """Create a requests session with TLS 1.2+ enforcement"""
     session = requests.Session()
 
-    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    # Stronger：TLS client context
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.options |= ssl.OP_NO_TLSv1
     ctx.options |= ssl.OP_NO_TLSv1_1
     ctx.set_ciphers(STRONG_CIPHERS)
     ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
 
     adapter = requests.adapters.HTTPAdapter()
     session.mount('https://', adapter)
