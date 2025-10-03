@@ -32,9 +32,9 @@ from flask_wtf import CSRFProtect  # Import CSRF protection
 # --------------------------
 # Azure AD and Graph Configuration
 # --------------------------
-CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "a008a546-7935-47d7-8477-edab541d064d")
-CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "z4h8Q~Sr-oXYIaup4FwN3B4WfT4Lkon4Nig~3c~t")
-TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "22ac7df0-c294-4ccb-a895-092f49799529")
+CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "")
+TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "")
 
 # Validate required environment variables
 if not CLIENT_SECRET:
@@ -62,11 +62,13 @@ def requests_session() -> requests.Session:
     """Create a requests session with TLS 1.2+ enforcement"""
     session = requests.Session()
 
-    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    # stronger：TLS client context
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.options |= ssl.OP_NO_TLSv1
     ctx.options |= ssl.OP_NO_TLSv1_1
     ctx.set_ciphers(STRONG_CIPHERS)
     ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
 
     adapter = requests.adapters.HTTPAdapter()
     session.mount('https://', adapter)
@@ -96,7 +98,7 @@ KEY_FILE        = os.getenv("SSL_KEY_FILE", os.path.join(os.path.dirname(__file_
 ALLOWED_IPS     = set(os.getenv("ALLOWED_IPS", "127.0.0.1,192.168.1.100").split(','))
 ALLOWED_SUBNETS = {
     ipaddress.ip_network(cidr)
-    for cidr in os.getenv("ALLOWED_SUBNETS", "172.16.0.0/16,192.168.0.0/16,10.0.0.0/16").split(',')
+    for cidr in os.getenv("ALLOWED_SUBNETS", "172.16.0.0/16,10.0.0.0/16").split(',')
 }
 
 # --------------------------
@@ -374,11 +376,11 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
     try:
         azure_ad_id = get_azure_ad_device_id(token, device_name)
         if not azure_ad_id:
-            return [], f"No device found with name: '{device_name}'"
+            return [], "No device found with name: '{device_name}'"
 
         keys = fetch_bitlocker_keys(token, azure_ad_id)
         if not keys:
-            return [], f"No BitLocker keys found for device: '{device_name}'."
+            return [], "No BitLocker keys found for device: '{device_name}'."
 
         key_list = []
         for key in keys:
@@ -397,13 +399,13 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
                 qr_cache.append(buf)
 
         if not key_list:
-            return [], f"Failed to retrieve their values."
+            return [], "Failed to retrieve their values."
 
         return key_list, None
 
     except Exception as e:
         error_msg = f"Error looking up keys: {str(e)}. Please try again later."
-        print(f"❌ Web lookup error: {error_msg}")
+        print("❌ Web lookup error: {error_msg}")
         return [], error_msg
 
 # --------------------------
@@ -431,16 +433,16 @@ def login():
     user_pin = request.form.get('pin', '').strip()
     if user_pin == VALID_PIN:
         session['authenticated'] = True
-        print(f"✅ User authenticated with correct PIN")
+        print("✅ User authenticated with correct PIN")
         return redirect('/')
-    print(f"⚠️ Failed PIN attempt from {request.remote_addr}")
+    print("Failed PIN attempt from {request.remote_addr}")
     return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
 
 @flask_app.route('/search', methods=['POST'])
 def search():
     """Device search and key lookup (POST-only)"""
     if not session.get('authenticated'):
-        print(f"🚫 Unauthorized search attempt from {request.remote_addr}")
+        print("🚫 Unauthorized search attempt from {request.remote_addr}")
         return redirect('/')
 
     key_list = []
@@ -450,12 +452,12 @@ def search():
     if not device_name:
         error = "Please enter a device name to search for."
     else:
-        print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
+        print("🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
         try:
             token = get_access_token()
             key_list, error = find_recovery_keys_web(token, device_name)
         except Exception as e:
-            error = f"Server error during lookup: {str(e)}"
+            error = "Server error during lookup: {str(e)}"
 
     return render_template_string(
         MAIN_PAGE_TEMPLATE,
