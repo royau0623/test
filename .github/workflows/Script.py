@@ -1,9 +1,8 @@
 """
-Intune BitLocker Key Manager - Production Version
+Intune BitLocker Key Manager - Secure Production Version
 
 A secure web application to retrieve BitLocker recovery keys from Microsoft Intune
-using Azure AD authentication. Enforces TLS 1.2+ for all communications and includes
-security hardening for production environments.
+using Azure AD authentication. Includes CSRF protection and TLS 1.2+ enforcement.
 """
 
 # Standard library imports
@@ -28,6 +27,7 @@ from flask import (
     Flask, request, render_template_string, redirect,
     session, send_file, abort, make_response
 )
+from flask_wtf import CSRFProtect  # Import CSRF protection
 
 # --------------------------
 # Azure AD and Graph Configuration
@@ -52,7 +52,6 @@ MANAGED_DEVICES_URL= f"{BASE_URL}/deviceManagement/managedDevices"
 # --------------------------
 # Security Hardening - TLS Configuration
 # --------------------------
-# Strong cipher suites for TLS 1.2+ (modern browsers and services)
 STRONG_CIPHERS = (
     'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:'
     'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:'
@@ -60,41 +59,40 @@ STRONG_CIPHERS = (
 )
 
 def requests_session() -> requests.Session:
-    """
-    Create a requests session with TLS 1.2+ enforcement for Graph API communication.
-    Blocks all connections using TLS 1.0 and 1.1.
-    """
+    """Create a requests session with TLS 1.2+ enforcement"""
     session = requests.Session()
 
-    # Create TLS context that enforces TLS 1.2 or higher
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    ctx.options |= ssl.OP_NO_TLSv1  # Disable TLS 1.0
-    ctx.options |= ssl.OP_NO_TLSv1_1  # Disable TLS 1.1
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
     ctx.set_ciphers(STRONG_CIPHERS)
-    ctx.verify_mode = ssl.CERT_REQUIRED  # Enforce certificate validation
+    ctx.verify_mode = ssl.CERT_REQUIRED
 
-    # Mount the context to all HTTPS requests
     adapter = requests.adapters.HTTPAdapter()
     session.mount('https://', adapter)
-    session.verify = True  # Enable SSL verification (critical for production)
+    session.verify = True
     return session
 
 # --------------------------
-# Flask App Configuration
+# Flask App Configuration with CSRF Protection
 # --------------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = os.getenv("FLASK_SECRET_KEY",
     ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
 )
 
-# Production settings - restrict access appropriately
-BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')  # Adjust based on network requirements
+# Initialize CSRF protection
+csrf = CSRFProtect()
+csrf.init_app(flask_app)  # Enable CSRF protection for all routes
+
+# Production settings
+BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')
 HTTP_PORT       = int(os.getenv("HTTP_PORT", "80"))
 HTTPS_PORT      = int(os.getenv("HTTPS_PORT", "8443"))
 CERT_FILE       = os.getenv("SSL_CERT_FILE", os.path.join(os.path.dirname(__file__), 'cert.pem'))
 KEY_FILE        = os.getenv("SSL_KEY_FILE", os.path.join(os.path.dirname(__file__), 'key.pem'))
 
-# IP Whitelisting - tighten for production
+# IP Whitelisting
 ALLOWED_IPS     = set(os.getenv("ALLOWED_IPS", "127.0.0.1,192.168.1.100").split(','))
 ALLOWED_SUBNETS = {
     ipaddress.ip_network(cidr)
@@ -102,21 +100,20 @@ ALLOWED_SUBNETS = {
 }
 
 # --------------------------
-# Global PIN Variable (generated once at startup)
+# Global PIN Variable
 # --------------------------
 VALID_PIN: str = ""
 
 def generate_pin() -> str:
-    """Generate a 6-digit PIN code (valid for current app session only)"""
+    """Generate a 6-digit PIN code"""
     return ''.join(secrets.choice(string.digits) for _ in range(6))
 
 # --------------------------
 # Azure AD Authentication
 # --------------------------
 def get_access_token() -> str:
-    """Get Microsoft Graph access token using service principal with secure TLS"""
+    """Get Microsoft Graph access token using service principal"""
     try:
-        # MSAL uses system TLS by default - ensure system defaults are secure
         app = msal.ConfidentialClientApplication(
             CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
         )
@@ -126,35 +123,33 @@ def get_access_token() -> str:
             error_msg = result.get("error_description", "Unknown authentication error")
             raise ValueError(f"Token acquisition failed: {error_msg}")
 
-        print("✅ Successfully acquired Graph access token (expires in ~1 hour)")
+        print("✅ Successfully acquired Graph access token")
         return result["access_token"]
 
     except ValueError as e:
-        raise RuntimeError("Authentication error: {str(e)}") from e
+        raise RuntimeError(f"Authentication error: {str(e)}") from e
     except Exception as e:
-        raise RuntimeError("Unexpected error during authentication: {str(e)}") from e
+        raise RuntimeError(f"Unexpected error during authentication: {str(e)}") from e
 
 # --------------------------
-# Device Lookup (Azure AD Device ID)
+# Device Lookup and Key Fetching
 # --------------------------
 def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
-    """Retrieve Azure AD Device ID using secure TLS 1.2+ connection"""
+    """Retrieve Azure AD Device ID"""
     url = (
         f"{MANAGED_DEVICES_URL}"
         f"?$filter=deviceName eq '{device_name}'"
         "&$select=azureADDeviceId,deviceName"
-        "&$top=1"  # Get only the first matching device
+        "&$top=1"
     )
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        # Use our secure session with TLS 1.2+ enforcement
         req_session = requests_session()
         resp = req_session.get(url, headers=headers)
-        resp.raise_for_status()  # Throw error for non-200 status codes
+        resp.raise_for_status()
         data = resp.json()
 
-        # Check if any devices were found
         if not data.get("value") or len(data["value"]) == 0:
             print(f"❌ No device found with name: {device_name}")
             return None
@@ -163,7 +158,7 @@ def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
         azure_ad_id = device.get("azureADDeviceId")
 
         if not azure_ad_id:
-            print(f"❌ Device {device_name} exists but has no Azure AD Device ID")
+            print(f"❌ Device {device_name} has no Azure AD Device ID")
             return None
 
         print(f"✅ Found Azure AD Device ID for {device_name}: {azure_ad_id}")
@@ -173,7 +168,7 @@ def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
         print(f"❌ HTTP Error fetching device: {e.response.status_code} - {e.response.text}")
         return None
     except requests.exceptions.SSLError as e:
-        print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+        print(f"❌ TLS/SSL Error: {str(e)}")
         return None
     except Exception as e:
         print(f"❌ Error fetching device: {str(e)}")
@@ -181,11 +176,8 @@ def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
     finally:
         req_session.close()
 
-# --------------------------
-# BitLocker Key Fetching (Direct from Intune)
-# --------------------------
 def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, Any]]:
-    """Fetch BitLocker keys using secure TLS 1.2+ connection to Intune"""
+    """Fetch BitLocker keys"""
     headers = {"Authorization": f"Bearer {token}"}
     keys = []
     url = LIST_KEYS_URL
@@ -195,42 +187,39 @@ def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, 
         "$filter": f"deviceId eq '{azure_ad_device_id}'"
     }
 
-    max_pages = 10  # Prevent infinite loops from pagination
+    max_pages = 10
     page_count = 0
 
     print(f"\n🔍 Starting BitLocker key lookup for Azure AD ID: {azure_ad_device_id}")
 
     while url and page_count < max_pages:
         try:
-            # Use secure session with TLS 1.2+ enforcement
             req_session = requests_session()
             resp = req_session.get(url, headers=headers, params=params)
 
-            # Handle 404 specifically (no keys exist)
             if resp.status_code == 404:
-                print("⚠️ No BitLocker keys found for this device")
+                print("⚠️ No BitLocker keys found")
                 break
 
-            resp.raise_for_status()  # Throw error for other non-200 statuses
+            resp.raise_for_status()
             data = resp.json()
             page_keys = data.get("value", [])
 
             if page_keys:
-                print(f"✅ Found {len(page_keys)} BitLocker key(s) on page {page_count}")
+                print(f"✅ Found {len(page_keys)} key(s) on page {page_count}")
                 keys.extend(page_keys)
             else:
-                print(f"ℹ️ No BitLocker keys found on page {page_count}")
+                print(f"ℹ️ No keys found on page {page_count}")
 
-            # Prepare for next page (if exists)
             url = data.get("@odata.nextLink")
             params = None
             page_count += 1
 
         except requests.exceptions.HTTPError as e:
-            print(f"❌ HTTP Error fetching keys: {e.response.status_code} - {e.response.text}")
+            print(f"❌ HTTP Error: {e.response.status_code} - {e.response.text}")
             break
         except requests.exceptions.SSLError as e:
-            print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+            print(f"❌ TLS/SSL Error: {str(e)}")
             break
         except Exception as e:
             print(f"❌ Error fetching keys: {str(e)}")
@@ -238,13 +227,12 @@ def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, 
         finally:
             req_session.close()
 
-    print(f"📊 Total BitLocker keys found: {len(keys)}")
+    print(f"📊 Total keys found: {len(keys)}")
     return keys
 
 def get_key_value(token: str, key_id: str) -> str | None:
-    """Get full recovery key value using secure TLS 1.2+ connection"""
+    """Get full recovery key value"""
     try:
-        # Use secure session with TLS 1.2+ enforcement
         req_session = requests_session()
         url = KEY_DETAIL_URL.format(id=key_id)
         resp = req_session.get(url, headers={"Authorization": f"Bearer {token}"})
@@ -253,10 +241,10 @@ def get_key_value(token: str, key_id: str) -> str | None:
         return resp.json().get("key")
 
     except requests.exceptions.SSLError as e:
-        print(f"❌ TLS/SSL Error - check certificate and TLS configuration: {str(e)}")
+        print(f"❌ TLS/SSL Error: {str(e)}")
         return None
     except Exception as e:
-        print(f"❌ Failed to get value for key {key_id[:8]}...: {str(e)}")
+        print(f"❌ Failed to get key {key_id[:8]}...: {str(e)}")
         return None
     finally:
         req_session.close()
@@ -275,13 +263,13 @@ def enforce_ip_whitelist():
         print(f"🚫 Blocked request from unauthorized IP: {client_ip}")
         abort(403, "Access Denied: Unauthorized IP Address")
     except ValueError:
-        print(f"⚠️ Invalid IP address format from client: {client_ip}")
+        print(f"⚠️ Invalid IP address: {client_ip}")
         abort(400, "Invalid Client IP Address Format")
 
-# QR Code Cache (temporary storage for generated QR codes)
+# QR Code Cache
 qr_cache: List[io.BytesIO] = []
 
-# HTML Templates (modified to remove Volume Type, Created, and QR code number labels)
+# HTML Templates with CSRF Tokens
 HTML_PIN_TEMPLATE = '''<!doctype html>
 <html lang="en">
 <head>
@@ -301,6 +289,8 @@ HTML_PIN_TEMPLATE = '''<!doctype html>
     <div class="container">
         <h1>Authentication Required</h1>
         <form method="post">
+            <!-- CSRF Token for security -->
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="text" name="pin" maxlength="6" required placeholder="Enter 6-digit PIN" pattern="[0-9]{6}">
             <button type="submit">Login</button>
         </form>
@@ -336,8 +326,9 @@ MAIN_PAGE_TEMPLATE = '''<!doctype html>
     <div class="container">
         <h1>BitLocker Recovery Key Lookup</h1>
 
-        <!-- Lookup Form -->
+        <!-- Lookup Form with CSRF Token -->
         <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="text" name="device" required placeholder="Enter Device Name (e.g., HKSTPXXX)" autocomplete="off">
             <button type="submit">Search for Keys</button>
         </form>
@@ -377,22 +368,18 @@ MAIN_PAGE_TEMPLATE = '''<!doctype html>
 </html>'''
 
 def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str, Any]], str | None]:
-    """Direct lookup of BitLocker keys from Intune with secure TLS"""
-    # Clear old QR codes
+    """Direct lookup of BitLocker keys from Intune"""
     qr_cache.clear()
 
     try:
-        # Step 1: Get Azure AD Device ID
         azure_ad_id = get_azure_ad_device_id(token, device_name)
         if not azure_ad_id:
             return [], f"No device found with name: '{device_name}'"
 
-        # Step 2: Fetch BitLocker keys directly from Intune
         keys = fetch_bitlocker_keys(token, azure_ad_id)
         if not keys:
             return [], f"No BitLocker keys found for device: '{device_name}'."
 
-        # Step 3: Get full key values and generate QR codes
         key_list = []
         for key in keys:
             full_key = get_key_value(token, key["id"])
@@ -403,7 +390,6 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
                 }
                 key_list.append(key_dict)
 
-                # Generate QR code for this key
                 buf = io.BytesIO()
                 qr = qrcode.make(full_key)
                 qr.save(buf, format='PNG', dpi=(150, 150))
@@ -425,8 +411,7 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
 # --------------------------
 @flask_app.route('/', methods=['GET','POST'])
 def index():
-    """Main web route (authentication + direct Intune lookup)"""
-    # Check authentication
+    """Main web route with authentication and lookup"""
     if not session.get('authenticated'):
         if request.method == 'POST':
             user_pin = request.form.get('pin', '').strip()
@@ -437,10 +422,8 @@ def index():
             print(f"⚠️ Failed PIN attempt from {request.remote_addr}")
             return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
 
-        # Show PIN form
         return render_template_string(HTML_PIN_TEMPLATE, error=None)
 
-    # Authenticated: Handle lookup request
     key_list = []
     error = None
     device_name = ""
@@ -452,9 +435,7 @@ def index():
         else:
             print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
             try:
-                # Get fresh token for each lookup (ensures validity)
                 token = get_access_token()
-                # Directly fetch from Intune - no CSV involved
                 key_list, error = find_recovery_keys_web(token, device_name)
             except Exception as e:
                 error = f"Server error during lookup: {str(e)}"
@@ -477,17 +458,14 @@ def serve_qr(qr_index: int):
         print(f"⚠️ Invalid QR code index {qr_index} requested")
         abort(404, "QR Code Not Found")
 
-    # Get QR code from cache
     buf = qr_cache[qr_index]
     buf.seek(0)
 
-    # Create response with no caching
     response = make_response(send_file(
         io.BytesIO(buf.getvalue()),
         mimetype='image/png'
     ))
 
-    # Add cache control headers
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
@@ -523,27 +501,18 @@ def run_redirect_server():
         print(f"❌ Failed to start HTTP redirect server: {str(e)}")
 
 # --------------------------
-# SSL Context Configuration (Server-Side)
+# SSL Context Configuration
 # --------------------------
 def create_ssl_context() -> ssl.SSLContext:
-    """
-    Create secure SSL context for HTTPS server (production-grade).
-    Enforces TLS 1.2+ and uses strong cipher suites.
-    """
+    """Create secure SSL context for HTTPS server"""
     try:
-        # Use modern TLS configuration
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT_FILE, KEY_FILE)
 
-        # Enforce TLS 1.2+ only (disable older protocols)
         ctx.options |= ssl.OP_NO_TLSv1
         ctx.options |= ssl.OP_NO_TLSv1_1
-
-        # Use strong cipher suites
         ctx.set_ciphers(STRONG_CIPHERS)
-
-        # Enable HSTS (HTTP Strict Transport Security)
-        ctx.set_alpn_protocols(['http/1.1'])  # Restrict to HTTP/1.1
+        ctx.set_alpn_protocols(['http/1.1'])
 
         return ctx
     except Exception as e:
@@ -557,16 +526,14 @@ def create_ssl_context() -> ssl.SSLContext:
 # --------------------------
 if __name__ == '__main__':
     print("="*60)
-    print("    BitLocker Key Manager (Production - TLS 1.2+ Enforced)")
+    print("    BitLocker Key Manager (Secure Production Version)")
     print("="*60)
 
-    # Generate PIN once at startup
     VALID_PIN = generate_pin()
     print("\n🔒 Generated Session PIN:", VALID_PIN)
     print("   - Valid for this session only")
     print("   - Will regenerate when application restarts")
 
-    # Check SSL certificates
     print("\n🔐 Checking SSL certificates...")
     if not os.path.exists(CERT_FILE):
         raise FileNotFoundError(
@@ -578,11 +545,9 @@ if __name__ == '__main__':
         )
     print("✅ SSL certificates found")
 
-    # Start HTTP redirect server
     redirect_thread = Thread(target=run_redirect_server, daemon=True)
     redirect_thread.start()
 
-    # Start HTTPS server with secure TLS configuration
     try:
         ssl_ctx = create_ssl_context()
         app_hostname = socket.gethostname()
