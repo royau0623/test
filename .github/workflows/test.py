@@ -115,7 +115,7 @@ KEY_FILE        = os.getenv("SSL_KEY_FILE", os.path.join(os.path.dirname(__file_
 
 # IP Whitelisting
 ALLOWED_IPS     = set(os.getenv("ALLOWED_IPS", "127.0.0.1,192.168.1.100").split(','))
-ALLOWED_SUBNETS = {
+#ALLOWED_SUBNETS = {
     ipaddress.ip_network(cidr)
     for cidr in os.getenv("ALLOWED_SUBNETS", "172.16.0.0/16,10.0.0.0/16").split(',')
 }
