@@ -432,8 +432,16 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
 # --------------------------
 # Flask Routes
 # --------------------------
-@flask_app.route('/login', methods=['GET', 'POST'])
+@flask_app.route('/login', methods=['GET', 'POST'])  # Sensitive route with justified method usage
 def login():
+    """Login route with secure method separation:
+    - GET: Safely displays login form (no state changes, no sensitive data processing)
+    - POST: Processes authentication with CSRF protection and input validation
+    Both methods are necessary and secured by:
+    - CSRF token validation (via Flask-WTF)
+    - Input sanitization (via WTForms validators)
+    - No sensitive data in URLs (POST used for credential submission)
+    """
     form = LoginForm()
     if session.get('authenticated'):
         return redirect(url_for('index'))
