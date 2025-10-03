@@ -33,7 +33,7 @@ from flask_wtf import CSRFProtect  # Import CSRF protection
 # Azure AD and Graph Configuration
 # --------------------------
 CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "a008a546-7935-47d7-8477-edab541d064d")
-CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "")
+CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "z4h8Q~Sr-oXYIaup4FwN3B4WfT4Lkon4Nig~3c~t")
 TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "22ac7df0-c294-4ccb-a895-092f49799529")
 
 # Validate required environment variables
@@ -409,9 +409,13 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
 # --------------------------
 # Flask Routes
 # --------------------------
-@flask_app.route('/', methods=['GET','POST'])
+@flask_app.route('/', methods=['GET', 'POST'])  # Sensitive route requiring both methods
 def index():
-    """Main web route with authentication and lookup"""
+    """Main web route with authentication and lookup
+    Handles both GET (form display) and POST (submission) for:
+    - PIN authentication
+    - Device search form processing
+    """
     if not session.get('authenticated'):
         if request.method == 'POST':
             user_pin = request.form.get('pin', '').strip()
@@ -447,9 +451,9 @@ def index():
         device_name=device_name
     )
 
-@flask_app.route('/qr/<int:qr_index>')
+@flask_app.route('/qr/<int:qr_index>')  # GET-only by default (secure for read operations)
 def serve_qr(qr_index: int):
-    """Serve QR code from cache"""
+    """Serve QR code from cache (read-only operation)"""
     if not session.get('authenticated'):
         print(f"🚫 Unauthorized QR code access attempt from {request.remote_addr}")
         return redirect('/')
