@@ -2,14 +2,14 @@
 Intune BitLocker Key Manager - Secure Production Version
 
 A secure web application to retrieve BitLocker recovery keys from Microsoft Intune
-using Azure AD authentication. Includes CSRF protection and TLS 1.2+ enforcement.
+using Entra ID authentication. Includes CSRF protection and TLS 1.2+ enforcement.
+Credentials can be provided via environment variables or manual input at startup.
 """
 
 # Standard library imports
 import os
 import ssl
 import io
-import ipaddress
 import socket
 import secrets
 import string
@@ -18,6 +18,8 @@ from typing import List, Dict, Any
 from gevent import pywsgi
 from gevent import monkey
 monkey.patch_all()
+# For secure credential input
+import getpass
 
 # Third-party imports
 import msal
@@ -30,15 +32,40 @@ from flask import (
 from flask_wtf import CSRFProtect  # Import CSRF protection
 
 # --------------------------
-# Azure AD and Graph Configuration
+# Entra ID and Graph Configuration - Dynamic Credential Input
 # --------------------------
-CLIENT_ID     = os.getenv("INTUNE_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("INTUNE_CLIENT_SECRET", "")
-TENANT_ID     = os.getenv("INTUNE_TENANT_ID", "")
+def get_credential(env_var: str, prompt: str, is_secret: bool = False) -> str:
+    """Get credential from environment variable or manual input"""
+    # Check environment variable first
+    value = os.getenv(env_var)
+    if value:
+        return value.strip()
+    
+    # Prompt for manual input if environment variable not set
+    while True:
+        if is_secret:
+            value = getpass.getpass(prompt=prompt).strip()
+        else:
+            value = input(prompt).strip()
+        
+        if value:
+            return value
+        print("❌ Value cannot be empty, please try again!")
 
-# Validate required environment variables
-if not CLIENT_SECRET:
-    raise RuntimeError("INTUNE_CLIENT_SECRET environment variable not set")
+# Get required credentials (environment variable or manual input)
+TENANT_ID     = get_credential(
+    "INTUNE_TENANT_ID", 
+    "Please enter your Tenant ID: "
+)
+CLIENT_ID     = get_credential(
+    "INTUNE_CLIENT_ID", 
+    "Please enter your Client ID (App Registration): "
+)
+CLIENT_SECRET = get_credential(
+    "INTUNE_CLIENT_SECRET", 
+    "Please enter your Client Secret: ",
+    is_secret=True  # Hide input for secret
+)
 
 AUTHORITY     = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPE         = ["https://graph.microsoft.com/.default"]
@@ -66,7 +93,6 @@ def requests_session() -> requests.Session:
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     
     # Explicitly set minimum and maximum TLS versions (Python 3.7+)
-    # Enforce TLS 1.2 as minimum, TLS 1.3 as maximum (modern and secure)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.maximum_version = ssl.TLSVersion.TLSv1_3  # Restrict to latest stable
     
@@ -76,20 +102,20 @@ def requests_session() -> requests.Session:
     ctx.options |= ssl.OP_NO_SSLv2  # Redundant in modern Python but explicit
     ctx.options |= ssl.OP_NO_SSLv3  # Redundant in modern Python but explicit
     
-    # Enforce strong cipher suites (restrict to AES-GCM and ChaCha20-Poly1305)
+    # Enforce strong cipher suites
     ctx.set_ciphers(STRONG_CIPHERS)
     
-    # Explicitly enable certificate verification (default in create_default_context but enforced here)
+    # Explicitly enable certificate verification
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.check_hostname = True  # Ensure hostname matches certificate
     
-    # Add HSTS-like behavior through request headers (optional but recommended)
+    # Add HSTS-like behavior through request headers
     session.headers.update({"Strict-Transport-Security": "max-age=31536000; includeSubDomains"})
 
     # Mount adapter with secure context
     adapter = requests.adapters.HTTPAdapter()
     session.mount('https://', adapter)
-    session.verify = True  # Double-enforce verification (defensive coding)
+    session.verify = True  # Double-enforce verification
     
     return session
     
@@ -107,18 +133,11 @@ csrf = CSRFProtect()
 csrf.init_app(flask_app)  # Enable CSRF protection for all routes
 
 # Production settings
-BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')
+#BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')
 HTTP_PORT       = int(os.getenv("HTTP_PORT", "80"))
 HTTPS_PORT      = int(os.getenv("HTTPS_PORT", "8443"))
 CERT_FILE       = os.getenv("SSL_CERT_FILE", os.path.join(os.path.dirname(__file__), 'cert.pem'))
 KEY_FILE        = os.getenv("SSL_KEY_FILE", os.path.join(os.path.dirname(__file__), 'key.pem'))
-
-# IP Whitelisting
-ALLOWED_IPS     = set(os.getenv("ALLOWED_IPS", "127.0.0.1,192.168.1.100").split(','))
-#ALLOWED_SUBNETS = {
-    ipaddress.ip_network(cidr)
-    for cidr in os.getenv("ALLOWED_SUBNETS", "172.16.0.0/16,10.0.0.0/16").split(',')
-}
 
 # --------------------------
 # Global PIN Variable
@@ -273,20 +292,6 @@ def get_key_value(token: str, key_id: str) -> str | None:
 # --------------------------
 # Web Interface Components
 # --------------------------
-@flask_app.before_request
-def enforce_ip_whitelist():
-    """Block requests from unapproved IPs/subnets"""
-    client_ip = request.remote_addr or ""
-    try:
-        ip_obj = ipaddress.ip_address(client_ip)
-        if client_ip in ALLOWED_IPS or any(ip_obj in net for net in ALLOWED_SUBNETS):
-            return
-        print(f"🚫 Blocked request from unauthorized IP: {client_ip}")
-        abort(403, "Access Denied: Unauthorized IP Address")
-    except ValueError:
-        print(f"⚠️ Invalid IP address: {client_ip}")
-        abort(400, "Invalid Client IP Address Format")
-
 # QR Code Cache
 qr_cache: List[io.BytesIO] = []
 
@@ -395,11 +400,11 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
     try:
         azure_ad_id = get_azure_ad_device_id(token, device_name)
         if not azure_ad_id:
-            return [], "No device found with name: '{device_name}'"
+            return [], f"No device found with name: '{device_name}'"
 
         keys = fetch_bitlocker_keys(token, azure_ad_id)
         if not keys:
-            return [], "No BitLocker keys found for device: '{device_name}'."
+            return [], f"No BitLocker keys found for device: '{device_name}'."
 
         key_list = []
         for key in keys:
@@ -424,18 +429,15 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
 
     except Exception as e:
         error_msg = f"Error looking up keys: {str(e)}. Please try again later."
-        print("❌ Web lookup error: {error_msg}")
+        print(f"❌ Web lookup error: {error_msg}")
         return [], error_msg
 
 # --------------------------
 # Flask Routes
 # --------------------------
-@flask_app.route('/', methods=['GET'])  # GET-only: safe method for page rendering
+@flask_app.route('/', methods=['GET'])
 def index():
-    """Main page renderer (GET-only).
-    - Unauthenticated users see the PIN form.
-    - Authenticated users see the search form.
-    """
+    """Main page renderer - shows PIN form for unauthenticated users"""
     if not session.get('authenticated'):
         return render_template_string(HTML_PIN_TEMPLATE, error=None)
 
@@ -448,20 +450,20 @@ def index():
 
 @flask_app.route('/login', methods=['POST'])
 def login():
-    """PIN authentication (POST-only)"""
+    """PIN authentication"""
     user_pin = request.form.get('pin', '').strip()
     if user_pin == VALID_PIN:
         session['authenticated'] = True
-        print("✅ User authenticated with correct PIN")
+        print(f"✅ User authenticated with correct PIN")
         return redirect('/')
-    print("Failed PIN attempt from {request.remote_addr}")
+    print(f"❌ Failed PIN attempt from {request.remote_addr}")
     return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
 
 @flask_app.route('/search', methods=['POST'])
 def search():
-    """Device search and key lookup (POST-only)"""
+    """Device search and key lookup"""
     if not session.get('authenticated'):
-        print("🚫 Unauthorized search attempt from {request.remote_addr}")
+        print(f"🚫 Unauthorized search attempt from {request.remote_addr}")
         return redirect('/')
 
     key_list = []
@@ -471,12 +473,12 @@ def search():
     if not device_name:
         error = "Please enter a device name to search for."
     else:
-        print("🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
+        print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
         try:
             token = get_access_token()
             key_list, error = find_recovery_keys_web(token, device_name)
         except Exception as e:
-            error = "Server error during lookup: {str(e)}"
+            error = f"Server error during lookup: {str(e)}"
 
     return render_template_string(
         MAIN_PAGE_TEMPLATE,
@@ -485,9 +487,9 @@ def search():
         device_name=device_name
     )
 
-@flask_app.route('/qr/<int:qr_index>')  # GET-only by default (secure for read operations)
+@flask_app.route('/qr/<int:qr_index>')
 def serve_qr(qr_index: int):
-    """Serve QR code from cache (read-only operation)"""
+    """Serve QR code from cache"""
     if not session.get('authenticated'):
         print(f"🚫 Unauthorized QR code access attempt from {request.remote_addr}")
         return redirect('/')
@@ -542,17 +544,16 @@ def run_redirect_server():
 # SSL Context Configuration
 # --------------------------
 def create_ssl_context() -> ssl.SSLContext:
-    """Create secure SSL context for HTTPS server with strict TLS 1.2+ enforcement"""
+    """Create secure SSL context with strict TLS 1.2+ enforcement"""
     try:
-        # Use TLS_SERVER with explicit version controls (Python 3.7+)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT_FILE, KEY_FILE)
 
-        # Explicitly set TLS version bounds (critical for SonarCloud compliance)
+        # Enforce TLS versions
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.maximum_version = ssl.TLSVersion.TLSv1_3  # Restrict to modern TLS
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
 
-        # Disable ALL legacy protocols (explicit defense against downgrade attacks)
+        # Disable legacy protocols
         ctx.options |= ssl.OP_NO_SSLv2
         ctx.options |= ssl.OP_NO_SSLv3
         ctx.options |= ssl.OP_NO_TLSv1
@@ -561,11 +562,11 @@ def create_ssl_context() -> ssl.SSLContext:
         # Enforce strong cipher suites
         ctx.set_ciphers(STRONG_CIPHERS)
 
-        # Restrict ALPN to secure HTTP protocols only
+        # Restrict ALPN protocols
         ctx.set_alpn_protocols(['http/1.1'])
 
-        # Enable session ticket hardening (optional but recommended)
-        ctx.session_ticket_key = ssl.RAND_bytes(48)  # Rotate periodically in production
+        # Session ticket hardening
+        ctx.session_ticket_key = ssl.RAND_bytes(48)
 
         return ctx
     except Exception as e:
@@ -579,14 +580,16 @@ def create_ssl_context() -> ssl.SSLContext:
 # --------------------------
 if __name__ == '__main__':
     print("="*60)
-    print("    BitLocker Key Manager (Secure Production Version)")
+    print("    BitLocker Recovery Tool (BRT)")
     print("="*60)
 
+    # Generate session PIN
     VALID_PIN = generate_pin()
     print("\n🔒 Generated Session PIN:", VALID_PIN)
     print("   - Valid for this session only")
     print("   - Will regenerate when application restarts")
 
+    # Verify SSL certificates
     print("\n🔐 Checking SSL certificates...")
     if not os.path.exists(CERT_FILE):
         raise FileNotFoundError(
@@ -598,10 +601,12 @@ if __name__ == '__main__':
         )
     print("✅ SSL certificates found")
 
+    # Start HTTP redirect server
     redirect_thread = Thread(target=run_redirect_server, daemon=True)
     redirect_thread.start()
 
     try:
+        # Create SSL context and start main server
         ssl_ctx = create_ssl_context()
         app_hostname = socket.gethostname()
         app_ip = socket.gethostbyname(app_hostname)
