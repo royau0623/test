@@ -624,4 +624,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n\n🛑 Application stopped by user")
     except Exception as e:
-        print(f"\n❌ Failed to start HTTPS server: {str(e)}")
+        print("\n❌ Failed to start HTTPS server: {str(e)}")
