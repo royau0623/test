@@ -454,7 +454,7 @@ def login():
     user_pin = request.form.get('pin', '').strip()
     if user_pin == VALID_PIN:
         session['authenticated'] = True
-        print(f"✅ User authenticated with correct PIN")
+        print("✅ User authenticated with correct PIN")
         return redirect('/')
     print(f"❌ Failed PIN attempt from {request.remote_addr}")
     return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
