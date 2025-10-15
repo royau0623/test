@@ -133,7 +133,7 @@ csrf = CSRFProtect()
 csrf.init_app(flask_app)  # Enable CSRF protection for all routes
 
 # Production settings
-#BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')
+BIND_ADDRESS    = os.getenv("BIND_ADDRESS", '0.0.0.0')
 HTTP_PORT       = int(os.getenv("HTTP_PORT", "80"))
 HTTPS_PORT      = int(os.getenv("HTTPS_PORT", "8443"))
 CERT_FILE       = os.getenv("SSL_CERT_FILE", os.path.join(os.path.dirname(__file__), 'cert.pem'))
@@ -624,4 +624,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n\n🛑 Application stopped by user")
     except Exception as e:
-        print("\n❌ Failed to start HTTPS server: {str(e)}")
+        print(f"\n❌ Failed to start HTTPS server: {str(e)}")
