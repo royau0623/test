@@ -67,14 +67,14 @@ CLIENT_SECRET = get_credential(
     is_secret=True  # Hide input for secret
 )
 
-AUTHORITY     = f"https://login.microsoftonline.com/{TENANT_ID}"
+AUTHORITY     = "https://login.microsoftonline.com/{TENANT_ID}"
 SCOPE         = ["https://graph.microsoft.com/.default"]
 
 # Graph endpoints
 BASE_URL           = "https://graph.microsoft.com/v1.0"
-LIST_KEYS_URL      = f"{BASE_URL}/informationProtection/bitlocker/recoveryKeys"
-KEY_DETAIL_URL     = f"{BASE_URL}/informationProtection/bitlocker/recoveryKeys/{{id}}?$select=key"
-MANAGED_DEVICES_URL= f"{BASE_URL}/deviceManagement/managedDevices"
+LIST_KEYS_URL      = "{BASE_URL}/informationProtection/bitlocker/recoveryKeys"
+KEY_DETAIL_URL     = "{BASE_URL}/informationProtection/bitlocker/recoveryKeys/{{id}}?$select=key"
+MANAGED_DEVICES_URL= "{BASE_URL}/deviceManagement/managedDevices"
 
 # --------------------------
 # Security Hardening - TLS Configuration
@@ -161,15 +161,15 @@ def get_access_token() -> str:
 
         if "access_token" not in result:
             error_msg = result.get("error_description", "Unknown authentication error")
-            raise ValueError(f"Token acquisition failed: {error_msg}")
+            raise ValueError("Token acquisition failed: {error_msg}")
 
         print("✅ Successfully acquired Graph access token")
         return result["access_token"]
 
     except ValueError as e:
-        raise RuntimeError(f"Authentication error: {str(e)}") from e
+        raise RuntimeError("Authentication error: {str(e)}") from e
     except Exception as e:
-        raise RuntimeError(f"Unexpected error during authentication: {str(e)}") from e
+        raise RuntimeError("Unexpected error during authentication: {str(e)}") from e
 
 # --------------------------
 # Device Lookup and Key Fetching
@@ -177,12 +177,12 @@ def get_access_token() -> str:
 def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
     """Retrieve Azure AD Device ID"""
     url = (
-        f"{MANAGED_DEVICES_URL}"
-        f"?$filter=deviceName eq '{device_name}'"
+        "{MANAGED_DEVICES_URL}"
+        "?$filter=deviceName eq '{device_name}'"
         "&$select=azureADDeviceId,deviceName"
         "&$top=1"
     )
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": "Bearer {token}"}
 
     try:
         req_session = requests_session()
@@ -191,46 +191,46 @@ def get_azure_ad_device_id(token: str, device_name: str) -> str | None:
         data = resp.json()
 
         if not data.get("value") or len(data["value"]) == 0:
-            print(f"❌ No device found with name: {device_name}")
+            print("❌ No device found with name: {device_name}")
             return None
 
         device = data["value"][0]
         azure_ad_id = device.get("azureADDeviceId")
 
         if not azure_ad_id:
-            print(f"❌ Device {device_name} has no Azure AD Device ID")
+            print("❌ Device {device_name} has no Azure AD Device ID")
             return None
 
-        print(f"✅ Found Azure AD Device ID for {device_name}: {azure_ad_id}")
+        print("✅ Found Azure AD Device ID for {device_name}: {azure_ad_id}")
         return azure_ad_id
 
     except requests.exceptions.HTTPError as e:
-        print(f"❌ HTTP Error fetching device: {e.response.status_code} - {e.response.text}")
+        print("❌ HTTP Error fetching device: {e.response.status_code} - {e.response.text}")
         return None
     except requests.exceptions.SSLError as e:
-        print(f"❌ TLS/SSL Error: {str(e)}")
+        print("❌ TLS/SSL Error: {str(e)}")
         return None
     except Exception as e:
-        print(f"❌ Error fetching device: {str(e)}")
+        print("❌ Error fetching device: {str(e)}")
         return None
     finally:
         req_session.close()
 
 def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, Any]]:
     """Fetch BitLocker keys"""
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": "Bearer {token}"}
     keys = []
     url = LIST_KEYS_URL
 
     params = {
         "$select": "id,deviceId",
-        "$filter": f"deviceId eq '{azure_ad_device_id}'"
+        "$filter": "deviceId eq '{azure_ad_device_id}'"
     }
 
     max_pages = 10
     page_count = 0
 
-    print(f"\n🔍 Starting BitLocker key lookup for Azure AD ID: {azure_ad_device_id}")
+    print("\n🔍 Starting BitLocker key lookup for Azure AD ID: {azure_ad_device_id}")
 
     while url and page_count < max_pages:
         try:
@@ -246,28 +246,28 @@ def fetch_bitlocker_keys(token: str, azure_ad_device_id: str) -> List[Dict[str, 
             page_keys = data.get("value", [])
 
             if page_keys:
-                print(f"✅ Found {len(page_keys)} key(s) on page {page_count}")
+                print("✅ Found {len(page_keys)} key(s) on page {page_count}")
                 keys.extend(page_keys)
             else:
-                print(f"ℹ️ No keys found on page {page_count}")
+                print("ℹ️ No keys found on page {page_count}")
 
             url = data.get("@odata.nextLink")
             params = None
             page_count += 1
 
         except requests.exceptions.HTTPError as e:
-            print(f"❌ HTTP Error: {e.response.status_code} - {e.response.text}")
+            print("❌ HTTP Error: {e.response.status_code} - {e.response.text}")
             break
         except requests.exceptions.SSLError as e:
-            print(f"❌ TLS/SSL Error: {str(e)}")
+            print("❌ TLS/SSL Error: {str(e)}")
             break
         except Exception as e:
-            print(f"❌ Error fetching keys: {str(e)}")
+            print("❌ Error fetching keys: {str(e)}")
             break
         finally:
             req_session.close()
 
-    print(f"📊 Total keys found: {len(keys)}")
+    print("📊 Total keys found: {len(keys)}")
     return keys
 
 def get_key_value(token: str, key_id: str) -> str | None:
@@ -275,16 +275,16 @@ def get_key_value(token: str, key_id: str) -> str | None:
     try:
         req_session = requests_session()
         url = KEY_DETAIL_URL.format(id=key_id)
-        resp = req_session.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp = req_session.get(url, headers={"Authorization": "Bearer {token}"})
         resp.raise_for_status()
 
         return resp.json().get("key")
 
     except requests.exceptions.SSLError as e:
-        print(f"❌ TLS/SSL Error: {str(e)}")
+        print("❌ TLS/SSL Error: {str(e)}")
         return None
     except Exception as e:
-        print(f"❌ Failed to get key {key_id[:8]}...: {str(e)}")
+        print("❌ Failed to get key {key_id[:8]}...: {str(e)}")
         return None
     finally:
         req_session.close()
@@ -355,7 +355,7 @@ MAIN_PAGE_TEMPLATE = '''<!doctype html>
         <!-- Lookup Form with CSRF Token -->
         <form method="post" action="/search">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <input type="text" name="device" required placeholder="Enter Device Name (e.g., HKSTPXXX)" autocomplete="off">
+            <input type="text" name="device" required placeholder="Enter Device Name (e.g., HKSTPXXX)" autocomplete="o">
             <button type="submit">Search for Keys</button>
         </form>
 
@@ -400,11 +400,11 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
     try:
         azure_ad_id = get_azure_ad_device_id(token, device_name)
         if not azure_ad_id:
-            return [], f"No device found with name: '{device_name}'"
+            return [], "No device found with name: '{device_name}'"
 
         keys = fetch_bitlocker_keys(token, azure_ad_id)
         if not keys:
-            return [], f"No BitLocker keys found for device: '{device_name}'."
+            return [], "No BitLocker keys found for device: '{device_name}'."
 
         key_list = []
         for key in keys:
@@ -428,8 +428,8 @@ def find_recovery_keys_web(token: str, device_name: str) -> tuple[List[Dict[str,
         return key_list, None
 
     except Exception as e:
-        error_msg = f"Error looking up keys: {str(e)}. Please try again later."
-        print(f"❌ Web lookup error: {error_msg}")
+        error_msg = "Error looking up keys: {str(e)}. Please try again later."
+        print("❌ Web lookup error: {error_msg}")
         return [], error_msg
 
 # --------------------------
@@ -456,14 +456,14 @@ def login():
         session['authenticated'] = True
         print("✅ User authenticated with correct PIN")
         return redirect('/')
-    print(f"❌ Failed PIN attempt from {request.remote_addr}")
+    print("❌ Failed PIN attempt from {request.remote_addr}")
     return render_template_string(HTML_PIN_TEMPLATE, error="Invalid PIN. Please try again.")
 
 @flask_app.route('/search', methods=['POST'])
 def search():
     """Device search and key lookup"""
     if not session.get('authenticated'):
-        print(f"🚫 Unauthorized search attempt from {request.remote_addr}")
+        print("🚫 Unauthorized search attempt from {request.remote_addr}")
         return redirect('/')
 
     key_list = []
@@ -473,12 +473,12 @@ def search():
     if not device_name:
         error = "Please enter a device name to search for."
     else:
-        print(f"🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
+        print("🔍 Web lookup request for device: '{device_name}' from {request.remote_addr}")
         try:
             token = get_access_token()
             key_list, error = find_recovery_keys_web(token, device_name)
         except Exception as e:
-            error = f"Server error during lookup: {str(e)}"
+            error = "Server error during lookup: {str(e)}"
 
     return render_template_string(
         MAIN_PAGE_TEMPLATE,
@@ -491,11 +491,11 @@ def search():
 def serve_qr(qr_index: int):
     """Serve QR code from cache"""
     if not session.get('authenticated'):
-        print(f"🚫 Unauthorized QR code access attempt from {request.remote_addr}")
+        print("🚫 Unauthorized QR code access attempt from {request.remote_addr}")
         return redirect('/')
 
     if qr_index < 0 or qr_index >= len(qr_cache):
-        print(f"⚠️ Invalid QR code index {qr_index} requested")
+        print("⚠️ Invalid QR code index {qr_index} requested")
         abort(404, "QR Code Not Found")
 
     buf = qr_cache[qr_index]
@@ -521,9 +521,9 @@ def redirect_app(env, start_response):
     path = env.get('PATH_INFO', '')
     qs = env.get('QUERY_STRING', '')
 
-    target = f"https://{host}:{HTTPS_PORT}{path}"
+    target = "https://{host}:{HTTPS_PORT}{path}"
     if qs:
-        target += f"?{qs}"
+        target += "?{qs}"
 
     start_response(
         '301 Moved Permanently',
@@ -535,10 +535,10 @@ def run_redirect_server():
     """Start HTTP redirect server in background thread"""
     try:
         redirect_server = pywsgi.WSGIServer((BIND_ADDRESS, HTTP_PORT), redirect_app)
-        print(f"🔀 HTTP redirect server running on {BIND_ADDRESS}:{HTTP_PORT}")
+        print("🔀 HTTP redirect server running on {BIND_ADDRESS}:{HTTP_PORT}")
         redirect_server.serve_forever()
     except Exception as e:
-        print(f"❌ Failed to start HTTP redirect server: {str(e)}")
+        print("❌ Failed to start HTTP redirect server: {str(e)}")
 
 # --------------------------
 # SSL Context Configuration
@@ -571,7 +571,7 @@ def create_ssl_context() -> ssl.SSLContext:
         return ctx
     except Exception as e:
         raise RuntimeError(
-            f"Failed to create SSL context: {str(e)}. "
+            "Failed to create SSL context: {str(e)}. "
             "Ensure valid TLS 1.2+ certificates are provided."
         ) from e
     
@@ -593,11 +593,11 @@ if __name__ == '__main__':
     print("\n🔐 Checking SSL certificates...")
     if not os.path.exists(CERT_FILE):
         raise FileNotFoundError(
-            f"SSL Certificate not found: {CERT_FILE}\nPlace valid TLS 1.2+ cert in this location."
+            "SSL Certificate not found: {CERT_FILE}\nPlace valid TLS 1.2+ cert in this location."
         )
     if not os.path.exists(KEY_FILE):
         raise FileNotFoundError(
-            f"SSL Private Key not found: {KEY_FILE}\nPlace matching private key in this location."
+            "SSL Private Key not found: {KEY_FILE}\nPlace matching private key in this location."
         )
     print("✅ SSL certificates found")
 
@@ -612,9 +612,9 @@ if __name__ == '__main__':
         app_ip = socket.gethostbyname(app_hostname)
 
         print("\n🚀 Web Server Ready (TLS 1.2+ enforced)")
-        print(f"   - HTTPS Address: https://{app_hostname}:{HTTPS_PORT}")
-        print(f"   - Alternative: https://{app_ip}:{HTTPS_PORT}")
-        print(f"   - Use PIN: {VALID_PIN} to authenticate")
+        print("   - HTTPS Address: https://{app_hostname}:{HTTPS_PORT}")
+        print("   - Alternative: https://{app_ip}:{HTTPS_PORT}")
+        print("   - Use PIN: {VALID_PIN} to authenticate")
         print("\nPress Ctrl+C to stop")
         print("="*60)
 
@@ -624,4 +624,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n\n🛑 Application stopped by user")
     except Exception as e:
-        print(f"\n❌ Failed to start HTTPS server: {str(e)}")
+        print("\n❌ Failed to start HTTPS server: {str(e)}")
